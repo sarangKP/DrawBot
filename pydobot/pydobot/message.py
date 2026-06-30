@@ -7,6 +7,10 @@ class Message:
             self.params = bytes([])
             self.checksum = None
         else:
+            if len(b) < 6:
+                raise ValueError(f'Response too short: {len(b)} bytes')
+            if b[0] != 0xAA or b[1] != 0xAA:
+                raise ValueError(f'Bad header: {b[0]:02x} {b[1]:02x}')
             self.header = b[0:2]
             self.len = b[2]
             self.id = b[3]

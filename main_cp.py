@@ -1,5 +1,5 @@
 # ── Constants ────────────────────────────────────────────────────────────────
-IMAGE_PATH      = "images/Tier_4.png"
+IMAGE_PATH      = "images/Tier_5.png"
 MAX_SIDE_PX     = 800
 CANNY_LOW       = 80
 CANNY_HIGH      = 200
@@ -10,15 +10,15 @@ MORPH_CLOSE_PX  = 0
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 CAL_ARM_XY = [
-    (303.6646423339844,    73.79429626464844),   # TL
-    (292.9056396484375, -120.05909729003906),    # TR
-    (171.79347229003906,  72.93241882324219),    # BL
-    (167.5027618408203,  -109.03446960449219),   # BR
+    (308.9599304199219,    68.61124420166016),   # TL
+    (292.4645690917969, -135.81228637695312),  # TR
+    (166.2382354736328,  69.30846405029297),  # BL
+    (162.52162170410156,  -139.58758544921875),  # BR
 ]
-CAL_Z_CORNERS = [-57.175079345703125, -57.43455505371094,
-                 -55.63251495361328, -56.73497772216797]
+CAL_Z_CORNERS = [-51.48863220214844, -50.695167541503906,
+                 -49.280738830566406, -52.93724822998047]
 
-Z_UP         = -25.011795043945312
+Z_UP         = -31.821640014648438   # pen-lifted height
 DRAW_SPEED   = 200     # mm/s CP drawing — Dobot firmware hard-caps ~200
 TRAVEL_SPEED = 300     # mm/s PTP pen-up travel
 Z_SPEED      = 150     # mm/s pen lift/lower
@@ -37,15 +37,20 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.collections as mc
+from pathlib import Path
+
+ROOT = Path(__file__).parent
 
 
 # ── Image pipeline ────────────────────────────────────────────────────────────
 
 def load_image(path: str) -> np.ndarray:
-    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    img = cv2.imread(str(ROOT / path), cv2.IMREAD_GRAYSCALE)
     if img is None:
         sys.exit(f"Cannot load image: {path}")
     h, w = img.shape
+    if w < 2 or h < 2:
+        sys.exit(f"Image too small: {w}×{h}")
     scale = MAX_SIDE_PX / max(h, w)
     if scale < 1.0:
         img = cv2.resize(img, (int(w * scale), int(h * scale)),
@@ -79,10 +84,11 @@ def extract_strokes(edges: np.ndarray) -> list[np.ndarray]:
 
     strokes = []
     for u, v, data in graph.edges(data=True):
-        node_u = graph.nodes[u]["o"]
-        node_v = graph.nodes[v]["o"]
-        pts    = np.vstack([node_u, data["pts"], node_v])
-        pts    = pts[:, ::-1].astype(float)
+        node_u = graph.nodes[u]["o"].reshape(1, 2)
+        node_v = graph.nodes[v]["o"].reshape(1, 2)
+        inner  = data["pts"].reshape(-1, 2)
+        pts    = np.vstack([node_u, inner, node_v])
+        pts    = pts[:, ::-1].astype(float)   # (row,col) → (col,row)
 
         simplified = cv2.approxPolyDP(
             pts.reshape(-1, 1, 2).astype(np.float32), APPROX_EPSILON, closed=False
@@ -99,6 +105,45 @@ def extract_strokes(edges: np.ndarray) -> list[np.ndarray]:
 def order_strokes(strokes: list[np.ndarray]) -> list[np.ndarray]:
     if not strokes:
         return strokes
+    try:
+        from scipy.spatial import KDTree
+        return _order_strokes_kdtree(strokes)
+    except ImportError:
+        return _order_strokes_greedy(strokes)
+
+
+def _order_strokes_kdtree(strokes: list[np.ndarray]) -> list[np.ndarray]:
+    from scipy.spatial import KDTree
+
+    n       = len(strokes)
+    used    = [False] * n
+    ordered = []
+    pen_pos = strokes[0][0]
+
+    for _ in range(n):
+        # rebuild tree each step from remaining unused endpoints
+        idx_map = []   # maps tree-row → (stroke_idx, is_end)
+        pts     = []
+        for i, s in enumerate(strokes):
+            if not used[i]:
+                pts.append(s[0]);  idx_map.append((i, False))
+                pts.append(s[-1]); idx_map.append((i, True))
+
+        tree = KDTree(np.array(pts))
+        _, row = tree.query(pen_pos)
+        stroke_i, flip = idx_map[row]
+
+        stroke = strokes[stroke_i]
+        if flip:
+            stroke = stroke[::-1]
+        ordered.append(stroke)
+        used[stroke_i] = True
+        pen_pos = stroke[-1]
+
+    return ordered
+
+
+def _order_strokes_greedy(strokes: list[np.ndarray]) -> list[np.ndarray]:
     remaining = list(strokes)
     ordered   = [remaining.pop(0)]
     pen_pos   = ordered[0][-1]
@@ -208,6 +253,21 @@ def _cp_cmd(arm, x: float, y: float, z: float, velocity: float):
     return arm._send_command(msg)
 
 
+def _recover(arm) -> None:
+    try:
+        _clear_alarm(arm)
+    except Exception:
+        pass
+    try:
+        arm._set_queued_cmd_clear()
+    except Exception:
+        pass
+    try:
+        arm._set_queued_cmd_start_exec()
+    except Exception:
+        pass
+
+
 # ── Draw loop ─────────────────────────────────────────────────────────────────
 
 def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
@@ -220,51 +280,55 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
         sys.exit("No serial ports found. Is the arm plugged in?")
     print(f"Connecting on {PORT} ...")
     arm = pydobot.Dobot(port=PORT, verbose=False)
-    _clear_alarm(arm)
-    arm._set_queued_cmd_clear()
-    arm._set_queued_cmd_start_exec()
 
-    pose = arm.pose()
-    print(f"Connected. Current pose: x={pose[0]:.1f} y={pose[1]:.1f} z={pose[2]:.1f}")
+    try:
+        _recover(arm)
 
-    arm.speed(TRAVEL_SPEED, TRAVEL_SPEED)
-    arm._set_ptp_cmd(pose[0], pose[1], Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
+        pose = arm.pose()
+        print(f"Connected. Current pose: x={pose[0]:.1f} y={pose[1]:.1f} z={pose[2]:.1f}")
 
-    skipped = 0
-    total = len(strokes)
-    for i, stroke in enumerate(strokes):
-        x0, y0, z0 = px_to_mm(stroke[0][0], stroke[0][1], img_w, img_h)
-        print(f"Stroke {i+1}/{total}  ({len(stroke)} pts)  xy=({x0:.1f},{y0:.1f}) z={z0:.1f}", end="\r")
-
-        # travel
         arm.speed(TRAVEL_SPEED, TRAVEL_SPEED)
-        arm._set_ptp_cmd(x0, y0, Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
+        arm._set_ptp_cmd(pose[0], pose[1], Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
 
-        # pen down
-        arm.speed(Z_SPEED, Z_SPEED)
-        try:
-            arm._set_ptp_cmd(x0, y0, z0, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
-        except RuntimeError:
-            print(f"\nSkipping stroke {i+1} — alarm at ({x0:.1f},{y0:.1f},{z0:.1f}), clearing...")
-            _clear_alarm(arm)
-            arm._set_queued_cmd_clear()
-            arm._set_queued_cmd_start_exec()
-            skipped += 1
-            continue
+        skipped = 0
+        total = len(strokes)
+        for i, stroke in enumerate(strokes):
+            x0, y0, z0 = px_to_mm(stroke[0][0], stroke[0][1], img_w, img_h)
+            print(f"Stroke {i+1}/{total}  ({len(stroke)} pts)  "
+                  f"xy=({x0:.1f},{y0:.1f}) z={z0:.1f}", end="\r")
 
-        # CP draw — all points queued without blocking
-        x_last, y_last = x0, y0
-        for pt in stroke[1:]:
-            x, y, z = px_to_mm(pt[0], pt[1], img_w, img_h)
-            _cp_cmd(arm, x, y, z, DRAW_SPEED)
-            x_last, y_last = x, y
+            # travel
+            arm.speed(TRAVEL_SPEED, TRAVEL_SPEED)
+            arm._set_ptp_cmd(x0, y0, Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
 
-        # pen up — PTP after CP; wait=True drains the CP queue first
-        arm.speed(Z_SPEED, Z_SPEED)
-        arm._set_ptp_cmd(x_last, y_last, Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
+            # pen down
+            arm.speed(Z_SPEED, Z_SPEED)
+            try:
+                arm._set_ptp_cmd(x0, y0, z0, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
+            except RuntimeError:
+                print(f"\nSkipping stroke {i+1} — alarm at "
+                      f"({x0:.1f},{y0:.1f},{z0:.1f}), clearing...")
+                _recover(arm)
+                skipped += 1
+                continue
 
-    print(f"\nDone — {total} strokes, {skipped} skipped.")
-    arm.close()
+            # CP draw — all points queued without blocking
+            # PTP pen-up is enqueued after all CP commands; waiting for its
+            # execution index implicitly drains the entire CP queue first.
+            x_last, y_last = x0, y0
+            for pt in stroke[1:]:
+                x, y, z = px_to_mm(pt[0], pt[1], img_w, img_h)
+                _cp_cmd(arm, x, y, z, DRAW_SPEED)
+                x_last, y_last = x, y
+
+            # pen up
+            arm.speed(Z_SPEED, Z_SPEED)
+            arm._set_ptp_cmd(x_last, y_last, Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
+
+        print(f"\nDone — {total} strokes, {skipped} skipped.")
+
+    finally:
+        arm.close()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -297,9 +361,9 @@ def main():
         print("Reach check OK.")
 
     if dry_run:
-        preview(gray, strokes)
+        preview(proc, strokes)
     else:
-        preview(gray, strokes)
+        preview(proc, strokes)
         input("Close the preview window, then press Enter to start drawing...")
         draw(strokes, w, h)
 

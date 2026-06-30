@@ -10,6 +10,7 @@ dependencies = [
     "numpy",
     "pyserial",
     "scikit-image",
+    "scipy",
     "sknw @ git+https://github.com/yxdragon/sknw.git",
     "pydobot @ file:///home/user/Dobot_v2/pydobot",
 ]

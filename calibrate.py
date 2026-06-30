@@ -12,28 +12,33 @@ then press Enter to record. Five positions total:
 
 For corners 2-5: lower the pen until it just touches the paper surface.
 
-On completion, CAL_ARM_XY, CAL_Z_CORNERS, and Z_UP in main.py are updated.
+On completion, CAL_ARM_XY, CAL_Z_CORNERS, and Z_UP in main.py and
+main_cp.py are both updated automatically.
 """
 
 import re
 import sys
+import time
+from pathlib import Path
 
+ROOT      = Path(__file__).parent
+TARGETS   = [ROOT / "main.py", ROOT / "main_cp.py"]
 PORT      = "/dev/ttyUSB0"
-MAIN_FILE = "main.py"
 
 
 def record(arm, label: str) -> tuple[float, float, float]:
     input(f"\n  [{label}]  Move arm → press Enter to record ... ")
+    time.sleep(0.5)   # let arm settle after releasing unlock button
     x, y, z, r, *_ = arm.pose()
     print(f"    x={x:.4f}  y={y:.4f}  z={z:.4f}")
     return x, y, z
 
 
-def patch_main(z_up: float,
+def patch_file(path: Path,
+               z_up: float,
                corners_xy: list[tuple[float, float]],
                corners_z: list[float]) -> None:
-    with open(MAIN_FILE) as f:
-        src = f.read()
+    src = path.read_text()
 
     tl, tr, bl, br = corners_xy
     ztl, ztr, zbl, zbr = corners_z
@@ -55,15 +60,13 @@ def patch_main(z_up: float,
     src = re.sub(r"CAL_Z_CORNERS\s*=\s*\[.*?\]", new_z, src, flags=re.DOTALL)
 
     src = re.sub(
-        r"Z_UP\s*=\s*[^\n#]+",
+        r"Z_UP\s*=\s*[^\n]+",
         f"Z_UP         = {z_up}   # pen-lifted height",
         src,
     )
 
-    with open(MAIN_FILE, "w") as f:
-        f.write(src)
-
-    print(f"\n✓ {MAIN_FILE} updated.")
+    path.write_text(src)
+    print(f"  ✓ {path.name} updated.")
 
 
 def main():
@@ -93,7 +96,12 @@ def main():
     for name, (cx, cy), cz in zip(("TL", "TR", "BL", "BR"), corners_xy, corners_z):
         print(f"  {name}   xy=({cx:.4f}, {cy:.4f})  z={cz:.4f}")
 
-    patch_main(z_up, corners_xy, corners_z)
+    print()
+    for target in TARGETS:
+        if target.exists():
+            patch_file(target, z_up, corners_xy, corners_z)
+        else:
+            print(f"  ! {target.name} not found, skipping.")
 
 
 if __name__ == "__main__":

@@ -9,12 +9,12 @@ from .enums import PTPMode
 from .enums.CommunicationProtocolIDs import CommunicationProtocolIDs
 from .enums.ControlValues import ControlValues
 
+WAIT_TIMEOUT_S = 60.0   # max seconds to wait for a queued command to execute
+
 
 class Dobot:
 
     def __init__(self, port, verbose=False):
-        threading.Thread.__init__(self)
-
         self._on = True
         self.verbose = verbose
         self.lock = threading.Lock()
@@ -35,42 +35,31 @@ class Dobot:
         self._set_ptp_common_params(velocity=100, acceleration=100)
         self._get_pose()
 
-    """
-        Gets the current command index
-    """
     def _get_queued_cmd_current_index(self):
         msg = Message()
         msg.id = CommunicationProtocolIDs.GET_QUEUED_CMD_CURRENT_INDEX
         response = self._send_command(msg)
-        idx = struct.unpack_from('L', response.params, 0)[0]
+        idx = struct.unpack_from('<I', response.params, 0)[0]
         return idx
 
-    """
-        Gets the real-time pose of the Dobot
-    """
     def _get_pose(self):
         msg = Message()
         msg.id = CommunicationProtocolIDs.GET_POSE
         response = self._send_command(msg)
-        self.x = struct.unpack_from('f', response.params, 0)[0]
-        self.y = struct.unpack_from('f', response.params, 4)[0]
-        self.z = struct.unpack_from('f', response.params, 8)[0]
-        self.r = struct.unpack_from('f', response.params, 12)[0]
+        self.x  = struct.unpack_from('f', response.params, 0)[0]
+        self.y  = struct.unpack_from('f', response.params, 4)[0]
+        self.z  = struct.unpack_from('f', response.params, 8)[0]
+        self.r  = struct.unpack_from('f', response.params, 12)[0]
         self.j1 = struct.unpack_from('f', response.params, 16)[0]
         self.j2 = struct.unpack_from('f', response.params, 20)[0]
         self.j3 = struct.unpack_from('f', response.params, 24)[0]
         self.j4 = struct.unpack_from('f', response.params, 28)[0]
 
         if self.verbose:
-            print("pydobot: x:%03.1f \
-                            y:%03.1f \
-                            z:%03.1f \
-                            r:%03.1f \
-                            j1:%03.1f \
-                            j2:%03.1f \
-                            j3:%03.1f \
-                            j4:%03.1f" %
-                  (self.x, self.y, self.z, self.r, self.j1, self.j2, self.j3, self.j4))
+            print("pydobot: x:%03.1f y:%03.1f z:%03.1f r:%03.1f "
+                  "j1:%03.1f j2:%03.1f j3:%03.1f j4:%03.1f" %
+                  (self.x, self.y, self.z, self.r,
+                   self.j1, self.j2, self.j3, self.j4))
         return response
 
     def _read_message(self):
@@ -78,18 +67,22 @@ class Dobot:
         while time.time() < deadline:
             time.sleep(0.05)
             b = self.ser.read_all()
-            if len(b) > 0:
-                msg = Message(b)
-                if self.verbose:
-                    print('pydobot: <<', msg)
-                return msg
+            if len(b) < 6:
+                continue
+            if b[0] != 0xAA or b[1] != 0xAA:
+                self.ser.reset_input_buffer()
+                continue
+            msg = Message(b)
+            if self.verbose:
+                print('pydobot: <<', msg)
+            return msg
         return None
 
     def _send_command(self, msg, wait=False):
-        self.lock.acquire()
-        self._send_message(msg)
-        response = self._read_message()
-        self.lock.release()
+        with self.lock:
+            self.ser.reset_input_buffer()
+            self._send_message(msg)
+            response = self._read_message()
 
         if response is None:
             raise RuntimeError(f'No response from arm (id={msg.id})')
@@ -97,79 +90,62 @@ class Dobot:
         if not wait:
             return response
 
-        expected_idx = struct.unpack_from('L', response.params, 0)[0]
+        expected_idx = struct.unpack_from('<I', response.params, 0)[0]
         if self.verbose:
             print('pydobot: waiting for command', expected_idx)
 
+        deadline = time.time() + WAIT_TIMEOUT_S
         while True:
             current_idx = self._get_queued_cmd_current_index()
 
-            if current_idx >= expected_idx:
+            if (current_idx - expected_idx) % (2 ** 32) < 2 ** 31:
                 if self.verbose:
                     print('pydobot: command %d executed' % current_idx)
                 break
+
+            if time.time() > deadline:
+                raise RuntimeError(
+                    f'Timeout waiting for command {expected_idx} '
+                    f'(current={current_idx})'
+                )
 
             time.sleep(0.1)
 
         return response
 
     def _send_message(self, msg):
-        time.sleep(0.1)
+        time.sleep(0.02)
         if self.verbose:
             print('pydobot: >>', msg)
         self.ser.write(msg.bytes())
 
-    """
-        Sets the status of the gripper
-    """
     def _set_end_effector_gripper(self, enable=False):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_GET_END_EFFECTOR_GRIPPER
         msg.ctrl = ControlValues.THREE
         msg.params = bytearray([])
         msg.params.extend(bytearray([0x01]))
-        if enable is True:
-            msg.params.extend(bytearray([0x01]))
-        else:
-            msg.params.extend(bytearray([0x00]))
+        msg.params.extend(bytearray([0x01 if enable else 0x00]))
         return self._send_command(msg)
 
-    """
-        Sets the status of the suction cup
-    """
     def _set_end_effector_suction_cup(self, enable=False):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_GET_END_EFFECTOR_SUCTION_CUP
         msg.ctrl = ControlValues.THREE
         msg.params = bytearray([])
         msg.params.extend(bytearray([0x01]))
-        if enable is True:
-            msg.params.extend(bytearray([0x01]))
-        else:
-            msg.params.extend(bytearray([0x00]))
+        msg.params.extend(bytearray([0x01 if enable else 0x00]))
         return self._send_command(msg)
 
-    """
-        Sets the velocity ratio and the acceleration ratio in PTP mode
-    """
     def _set_ptp_joint_params(self, v_x, v_y, v_z, v_r, a_x, a_y, a_z, a_r):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_GET_PTP_JOINT_PARAMS
         msg.ctrl = ControlValues.THREE
         msg.params = bytearray([])
-        msg.params.extend(bytearray(struct.pack('f', v_x)))
-        msg.params.extend(bytearray(struct.pack('f', v_y)))
-        msg.params.extend(bytearray(struct.pack('f', v_z)))
-        msg.params.extend(bytearray(struct.pack('f', v_r)))
-        msg.params.extend(bytearray(struct.pack('f', a_x)))
-        msg.params.extend(bytearray(struct.pack('f', a_y)))
-        msg.params.extend(bytearray(struct.pack('f', a_z)))
-        msg.params.extend(bytearray(struct.pack('f', a_r)))
+        for v in (v_x, v_y, v_z, v_r, a_x, a_y, a_z, a_r):
+            msg.params.extend(bytearray(struct.pack('f', v)))
         return self._send_command(msg)
 
-    """
-        Sets the velocity and acceleration of the Cartesian coordinate axes in PTP mode
-    """
     def _set_ptp_coordinate_params(self, velocity, acceleration):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_GET_PTP_COORDINATE_PARAMS
@@ -181,9 +157,6 @@ class Dobot:
         msg.params.extend(bytearray(struct.pack('f', acceleration)))
         return self._send_command(msg)
 
-    """
-       Sets the lifting height and the maximum lifting height in JUMP mode
-    """
     def _set_ptp_jump_params(self, jump, limit):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_GET_PTP_JUMP_PARAMS
@@ -193,10 +166,6 @@ class Dobot:
         msg.params.extend(bytearray(struct.pack('f', limit)))
         return self._send_command(msg)
 
-
-    """
-        Sets the velocity ratio, acceleration ratio in PTP mode
-    """
     def _set_ptp_common_params(self, velocity, acceleration):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_GET_PTP_COMMON_PARAMS
@@ -206,9 +175,6 @@ class Dobot:
         msg.params.extend(bytearray(struct.pack('f', acceleration)))
         return self._send_command(msg)
 
-    """
-        Executes PTP command
-    """
     def _set_ptp_cmd(self, x, y, z, r, mode, wait):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_PTP_CMD
@@ -221,27 +187,18 @@ class Dobot:
         msg.params.extend(bytearray(struct.pack('f', r)))
         return self._send_command(msg, wait)
 
-    """
-        Clears command queue
-    """
     def _set_queued_cmd_clear(self):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_QUEUED_CMD_CLEAR
         msg.ctrl = ControlValues.ONE
         return self._send_command(msg)
 
-    """
-        Start command
-    """
     def _set_queued_cmd_start_exec(self):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_QUEUED_CMD_START_EXEC
         msg.ctrl = ControlValues.ONE
         return self._send_command(msg)
 
-    """
-        Wait command
-    """
     def _set_wait_cmd(self, ms):
         msg = Message()
         msg.id = 110
@@ -249,9 +206,6 @@ class Dobot:
         msg.params = bytearray(struct.pack('I', ms))
         return self._send_command(msg)
 
-    """
-        Stop command
-    """
     def _set_queued_cmd_stop_exec(self):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_QUEUED_CMD_STOP_EXEC
@@ -262,17 +216,14 @@ class Dobot:
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_GET_EIO
         msg.ctrl = ControlValues.ZERO
-        msg.params = bytearray([])
-        msg.params.extend(bytearray([address]))
+        msg.params = bytearray([address])
         return self._send_command(msg)
 
     def _set_eio_level(self, address, level):
         msg = Message()
         msg.id = CommunicationProtocolIDs.SET_GET_EIO
         msg.ctrl = ControlValues.ONE
-        msg.params = bytearray([])
-        msg.params.extend(bytearray([address]))
-        msg.params.extend(bytearray([level]))
+        msg.params = bytearray([address, level])
         return self._send_command(msg)
 
     def get_eio(self, addr):
@@ -283,11 +234,10 @@ class Dobot:
 
     def close(self):
         self._on = False
-        self.lock.acquire()
-        self.ser.close()
-        if self.verbose:
-            print('pydobot: %s closed' % self.ser.name)
-        self.lock.release()
+        with self.lock:
+            self.ser.close()
+            if self.verbose:
+                print('pydobot: %s closed' % self.ser.name)
 
     def go(self, x, y, z, r=0.):
         warnings.warn('go() is deprecated, use move_to() instead')
@@ -311,10 +261,10 @@ class Dobot:
 
     def pose(self):
         response = self._get_pose()
-        x = struct.unpack_from('f', response.params, 0)[0]
-        y = struct.unpack_from('f', response.params, 4)[0]
-        z = struct.unpack_from('f', response.params, 8)[0]
-        r = struct.unpack_from('f', response.params, 12)[0]
+        x  = struct.unpack_from('f', response.params, 0)[0]
+        y  = struct.unpack_from('f', response.params, 4)[0]
+        z  = struct.unpack_from('f', response.params, 8)[0]
+        r  = struct.unpack_from('f', response.params, 12)[0]
         j1 = struct.unpack_from('f', response.params, 16)[0]
         j2 = struct.unpack_from('f', response.params, 20)[0]
         j3 = struct.unpack_from('f', response.params, 24)[0]
