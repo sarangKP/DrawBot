@@ -1,0 +1,16 @@
+[project]
+name = "dobot-v2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "opencv-python",
+    "matplotlib",
+    "numpy",
+    "pyserial",
+    "pydobot @ file:///home/user/Dobot_v2/pydobot",
+]
+
+[tool.setuptools]
+packages = []
