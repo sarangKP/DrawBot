@@ -1,10 +1,10 @@
 # ── Constants ────────────────────────────────────────────────────────────────
-IMAGE_PATH      = "images/heart_pruned_thin.png"
+IMAGE_PATH      = "images/Tier_3.png"
 MAX_SIDE_PX     = 800
-CANNY_LOW       = 50
-CANNY_HIGH      = 150
-APPROX_EPSILON  = 2.0           # higher = fewer points per stroke
-MIN_CONTOUR_PTS = 5
+CANNY_LOW       = 80            # high thresholds → strong edges only
+CANNY_HIGH      = 200
+APPROX_EPSILON  = 2.0           # RDP tolerance after skeletonisation (px)
+MIN_STROKE_LEN  = 15            # drop strokes shorter than this (px)
 
 # ── Calibration ───────────────────────────────────────────────────────────────
 # 4-point bilinear: normalised pixel [0,1]×[0,1] → arm (x,y) mm
@@ -53,23 +53,44 @@ def load_image(path: str) -> np.ndarray:
     return img
 
 
-# ── Step 2: edge detection ───────────────────────────────────────────────────
+# ── Step 2: preprocess + edge detection ─────────────────────────────────────
+
+def preprocess(gray: np.ndarray) -> np.ndarray:
+    """CLAHE contrast boost + mild blur before Canny."""
+    clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    return cv2.GaussianBlur(enhanced, (3, 3), 0)
+
 
 def detect_edges(gray: np.ndarray) -> np.ndarray:
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    return cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH)
+    return cv2.Canny(gray, CANNY_LOW, CANNY_HIGH)
 
 
-# ── Step 3: find & simplify contours ────────────────────────────────────────
+# ── Step 3: skeletonise + sknw graph → strokes ──────────────────────────────
 
 def extract_strokes(edges: np.ndarray) -> list[np.ndarray]:
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    from skimage.morphology import skeletonize
+    import sknw
+
+    skeleton = skeletonize(edges > 0).astype(np.uint8)
+    graph    = sknw.build_sknw(skeleton)
+
     strokes = []
-    for c in contours:
-        simplified = cv2.approxPolyDP(c, APPROX_EPSILON, closed=False)
-        pts = simplified[:, 0, :]
-        if len(pts) >= MIN_CONTOUR_PTS:
-            strokes.append(pts.astype(float))
+    for u, v, data in graph.edges(data=True):
+        node_u = graph.nodes[u]["o"]              # (row, col)
+        node_v = graph.nodes[v]["o"]
+        pts    = np.vstack([node_u, data["pts"], node_v])
+        pts    = pts[:, ::-1].astype(float)       # → (col, row)
+
+        length = np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1))
+        if length < MIN_STROKE_LEN:
+            continue
+
+        simplified = cv2.approxPolyDP(
+            pts.reshape(-1, 1, 2).astype(np.float32), APPROX_EPSILON, closed=False
+        )
+        strokes.append(simplified[:, 0, :].astype(float))
+
     return strokes
 
 
@@ -133,7 +154,7 @@ def preview(gray: np.ndarray, strokes: list[np.ndarray]) -> None:
     _, axes = plt.subplots(1, 2, figsize=(12, 6))
 
     axes[0].imshow(gray, cmap="gray")
-    axes[0].set_title("Edge map")
+    axes[0].set_title("Input (preprocessed)")
     axes[0].axis("off")
 
     h, w   = gray.shape
@@ -207,7 +228,8 @@ def main():
 
     gray    = load_image(IMAGE_PATH)
     h, w    = gray.shape
-    edges   = detect_edges(gray)
+    proc    = preprocess(gray)
+    edges   = detect_edges(proc)
     strokes = extract_strokes(edges)
     strokes = order_strokes(strokes)
 
