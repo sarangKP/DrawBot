@@ -1,39 +1,36 @@
 # ── Constants ────────────────────────────────────────────────────────────────
-IMAGE_PATH      = "images/Butterfly.jpeg"
+IMAGE_PATH      = "images/Tier_4.png"
 MAX_SIDE_PX     = 800
-CANNY_LOW       = 80            # high thresholds → strong edges only
+CANNY_LOW       = 80
 CANNY_HIGH      = 200
-APPROX_EPSILON  = 2.0           # RDP tolerance after skeletonisation (px)
-MIN_STROKE_LEN  = 15            # drop strokes shorter than this (px)
-BLUR_KERNEL     = 5             # pre-Canny Gaussian blur (odd number; larger = smoother/fewer edges)
-MORPH_CLOSE_PX  = 0             # morphological closing radius after Canny (0 = off; try 2-4)
+APPROX_EPSILON  = 2.0
+MIN_STROKE_LEN  = 15
+BLUR_KERNEL     = 5
+MORPH_CLOSE_PX  = 0
 
 # ── Calibration ───────────────────────────────────────────────────────────────
-# 4-point bilinear: normalised pixel [0,1]×[0,1] → arm (x,y) mm
-# Corner order: TL, TR, BL, BR  (pixel [0,0],[1,0],[0,1],[1,1])
 CAL_ARM_XY = [
     (303.6646423339844,    73.79429626464844),   # TL
-    (292.9056396484375, -120.05909729003906),  # TR
-    (171.79347229003906,  72.93241882324219),  # BL
-    (167.5027618408203,  -109.03446960449219),  # BR
+    (292.9056396484375, -120.05909729003906),    # TR
+    (171.79347229003906,  72.93241882324219),    # BL
+    (167.5027618408203,  -109.03446960449219),   # BR
 ]
-# z at paper surface, per corner (TL TR BL BR) — pen-down z is interpolated
 CAL_Z_CORNERS = [-57.175079345703125, -57.43455505371094,
                  -55.63251495361328, -56.73497772216797]
 
-Z_UP         = -25.011795043945312   # pen-lifted height# pen-lifted height
-DRAW_SPEED   = 200                   # mm/s while drawing (CP) — firmware caps ~200
-TRAVEL_SPEED = 300                   # mm/s pen-up travel between strokes
-Z_SPEED      = 100                   # mm/s pen lift/lower — slow = no bounce/alarm
+Z_UP         = -25.011795043945312
+DRAW_SPEED   = 200     # mm/s CP drawing — Dobot firmware hard-caps ~200
+TRAVEL_SPEED = 300     # mm/s PTP pen-up travel
+Z_SPEED      = 150     # mm/s pen lift/lower
 
 MIN_REACH_MM = 170.0
 MAX_REACH_MM = 315.0
 
-# Serial port — run `python -m serial.tools.list_ports` to find yours
 PORT = "/dev/ttyUSB0"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+import struct
 import sys
 import time
 import cv2
@@ -42,7 +39,7 @@ import matplotlib.pyplot as plt
 import matplotlib.collections as mc
 
 
-# ── Step 1: load & resize ────────────────────────────────────────────────────
+# ── Image pipeline ────────────────────────────────────────────────────────────
 
 def load_image(path: str) -> np.ndarray:
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
@@ -56,12 +53,10 @@ def load_image(path: str) -> np.ndarray:
     return img
 
 
-# ── Step 2: preprocess + edge detection ─────────────────────────────────────
-
 def preprocess(gray: np.ndarray) -> np.ndarray:
     clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(gray)
-    k = BLUR_KERNEL | 1        # force odd
+    k = BLUR_KERNEL | 1
     return cv2.GaussianBlur(enhanced, (k, k), 0)
 
 
@@ -75,8 +70,6 @@ def detect_edges(gray: np.ndarray) -> np.ndarray:
     return edges
 
 
-# ── Step 3: skeletonise + sknw graph → strokes ──────────────────────────────
-
 def extract_strokes(edges: np.ndarray) -> list[np.ndarray]:
     from skimage.morphology import skeletonize
     import sknw
@@ -86,10 +79,10 @@ def extract_strokes(edges: np.ndarray) -> list[np.ndarray]:
 
     strokes = []
     for u, v, data in graph.edges(data=True):
-        node_u = graph.nodes[u]["o"]              # (row, col)
+        node_u = graph.nodes[u]["o"]
         node_v = graph.nodes[v]["o"]
         pts    = np.vstack([node_u, data["pts"], node_v])
-        pts    = pts[:, ::-1].astype(float)       # → (col, row)
+        pts    = pts[:, ::-1].astype(float)
 
         simplified = cv2.approxPolyDP(
             pts.reshape(-1, 1, 2).astype(np.float32), APPROX_EPSILON, closed=False
@@ -102,8 +95,6 @@ def extract_strokes(edges: np.ndarray) -> list[np.ndarray]:
 
     return strokes
 
-
-# ── Step 4: nearest-neighbour stroke ordering ────────────────────────────────
 
 def order_strokes(strokes: list[np.ndarray]) -> list[np.ndarray]:
     if not strokes:
@@ -157,7 +148,7 @@ def check_reach(x_mm: float, y_mm: float) -> bool:
     return MIN_REACH_MM <= r <= MAX_REACH_MM
 
 
-# ── Matplotlib preview ───────────────────────────────────────────────────────
+# ── Preview ───────────────────────────────────────────────────────────────────
 
 def preview(gray: np.ndarray, strokes: list[np.ndarray]) -> None:
     _, axes = plt.subplots(1, 2, figsize=(12, 6))
@@ -188,7 +179,7 @@ def preview(gray: np.ndarray, strokes: list[np.ndarray]) -> None:
     plt.show()
 
 
-# ── Draw loop ────────────────────────────────────────────────────────────────
+# ── CP draw helpers ───────────────────────────────────────────────────────────
 
 def _clear_alarm(arm) -> None:
     from pydobot.message import Message
@@ -200,8 +191,24 @@ def _clear_alarm(arm) -> None:
     try:
         arm._send_command(msg)
     except RuntimeError:
-        pass  # arm may not respond while alarming; that's OK
+        pass
 
+
+def _cp_cmd(arm, x: float, y: float, z: float, velocity: float):
+    from pydobot.message import Message
+    from pydobot.enums.ControlValues import ControlValues
+    msg = Message()
+    msg.id = 91                    # SET_CP_CMD
+    msg.ctrl = ControlValues.THREE
+    msg.params = bytearray([0x01]) # cpMode = absolute
+    msg.params.extend(struct.pack('f', x))
+    msg.params.extend(struct.pack('f', y))
+    msg.params.extend(struct.pack('f', z))
+    msg.params.extend(struct.pack('f', velocity))
+    return arm._send_command(msg)
+
+
+# ── Draw loop ─────────────────────────────────────────────────────────────────
 
 def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
     import pydobot
@@ -221,7 +228,7 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
     print(f"Connected. Current pose: x={pose[0]:.1f} y={pose[1]:.1f} z={pose[2]:.1f}")
 
     arm.speed(TRAVEL_SPEED, TRAVEL_SPEED)
-    arm.move_to(pose[0], pose[1], Z_UP, 0, wait=True)
+    arm._set_ptp_cmd(pose[0], pose[1], Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
 
     skipped = 0
     total = len(strokes)
@@ -229,32 +236,30 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
         x0, y0, z0 = px_to_mm(stroke[0][0], stroke[0][1], img_w, img_h)
         print(f"Stroke {i+1}/{total}  ({len(stroke)} pts)  xy=({x0:.1f},{y0:.1f}) z={z0:.1f}", end="\r")
 
-        # travel pen-up (MOVJ — path doesn't matter, more forgiving at workspace edges)
+        # travel
         arm.speed(TRAVEL_SPEED, TRAVEL_SPEED)
         arm._set_ptp_cmd(x0, y0, Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
 
-        # lower pen — MOVJ avoids kinematic limit at high-reach positions
+        # pen down
         arm.speed(Z_SPEED, Z_SPEED)
         try:
             arm._set_ptp_cmd(x0, y0, z0, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
         except RuntimeError:
-            print(f"\nSkipping stroke {i+1} — arm alarmed at ({x0:.1f},{y0:.1f},{z0:.1f}), clearing...")
+            print(f"\nSkipping stroke {i+1} — alarm at ({x0:.1f},{y0:.1f},{z0:.1f}), clearing...")
             _clear_alarm(arm)
             arm._set_queued_cmd_clear()
             arm._set_queued_cmd_start_exec()
             skipped += 1
             continue
-        time.sleep(0.3)
 
-        # draw stroke — queue all points without blocking per-point
-        arm.speed(DRAW_SPEED, DRAW_SPEED)
+        # CP draw — all points queued without blocking
         x_last, y_last = x0, y0
         for pt in stroke[1:]:
             x, y, z = px_to_mm(pt[0], pt[1], img_w, img_h)
-            arm.move_to(x, y, z, 0, wait=False)
+            _cp_cmd(arm, x, y, z, DRAW_SPEED)
             x_last, y_last = x, y
 
-        # lift pen
+        # pen up — PTP after CP; wait=True drains the CP queue first
         arm.speed(Z_SPEED, Z_SPEED)
         arm._set_ptp_cmd(x_last, y_last, Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
 
@@ -262,7 +267,7 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
     arm.close()
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     dry_run = "--dry-run" in sys.argv or "-n" in sys.argv
@@ -279,7 +284,6 @@ def main():
     total_pts = sum(len(s) for s in strokes)
     print(f"Strokes: {len(strokes)},  total points: {total_pts}")
 
-    # Reach check
     bad = 0
     for s in strokes:
         for col, row in s:
@@ -295,7 +299,7 @@ def main():
     if dry_run:
         preview(gray, strokes)
     else:
-        preview(gray, strokes)          # confirm visually, then close window to draw
+        preview(gray, strokes)
         input("Close the preview window, then press Enter to start drawing...")
         draw(strokes, w, h)
 
