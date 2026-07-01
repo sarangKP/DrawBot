@@ -181,14 +181,3 @@ The bundled `pydobot/` is a modified fork of the original [pydobot](https://gith
 - **`message.py`** — Fixed checksum bug: `% 255` → `% 256`. The original produced checksum=0 for any packet whose payload byte-sum ≡ 1 (mod 256), causing the arm to silently drop those commands with no error.
 - **`dobot.py`** — Replaced blocking byte-by-byte serial read with `read_all()` retry loop (up to 1 second). Fixed `wait=True` polling to use `>=` instead of `!=` (prevents infinite loop if arm executes ahead). Raises `RuntimeError` with command ID on timeout instead of crashing with `AttributeError`.
 
----
-
-## Known Issues
-
-See `Report.md` for the full audit (21 findings). Most impactful open issues:
-
-- **C-3** — Stale serial response can contaminate the next command after a timeout
-- **H-3** — `calibrate.py` only patches `main.py`; `main_cp.py` calibration must be updated manually
-- **H-4** — No timeout in `wait=True` polling loop; motor stall hangs the script forever
-- **M-1** — Checksum=0 still possible when payload byte-sum is divisible by 256 (1-in-256 chance per command)
-- **L-2** — 100ms sleep before every serial write throttles throughput; arm idles between commands
