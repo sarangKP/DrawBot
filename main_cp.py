@@ -1,5 +1,5 @@
 # ── Constants ────────────────────────────────────────────────────────────────
-IMAGE_PATH      = "images/Tier_5.png"
+IMAGE_PATH      = "images/Heart.png"
 MAX_SIDE_PX     = 800
 CANNY_LOW       = 80
 CANNY_HIGH      = 200
