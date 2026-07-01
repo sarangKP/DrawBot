@@ -13,6 +13,7 @@ dependencies = [
     "scipy",
     "sknw @ git+https://github.com/yxdragon/sknw.git",
     "pydobot @ file:///home/user/Dobot_v2/pydobot",
+    "vpype>=1.15.0",
 ]
 
 [tool.setuptools]

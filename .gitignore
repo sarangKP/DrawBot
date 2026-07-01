@@ -9,3 +9,5 @@ wheels/
 # Virtual environments
 .venv
 /images
+main_cp_v2.py
+main_text.py
