@@ -3,6 +3,8 @@ IMAGE_PATH      = "/home/user/Dobot_v2/images/Test_2.png"
 MAX_SIDE_PX     = 800
 APPROX_EPSILON  = 1.5
 MIN_STROKE_LEN  = 3     # only drops degenerate specks, keeps short hatch marks
+MIN_STROKE_EXTENT_PX = 3.0  # bbox diagonal — drops dot-like curls the length filter misses
+JOIN_TOL_PX     = 2.0   # concatenate consecutive strokes with gap <= this (skips a pen lift)
 MORPH_CLOSE_PX  = 1     # closes small gaps in the ink mask before skeletonizing
 
 # ── Calibration ───────────────────────────────────────────────────────────────
@@ -16,9 +18,19 @@ CAL_Z_CORNERS = [-51.48863220214844, -50.695167541503906,
                  -49.280738830566406, -52.93724822998047]
 
 Z_UP         = -31.821640014648438   # pen-lifted height
-DRAW_SPEED   = 200     # mm/s CP drawing — Dobot firmware hard-caps ~200
-TRAVEL_SPEED = 300     # mm/s PTP pen-up travel
-Z_SPEED      = 150     # mm/s pen lift/lower
+
+# Speeds: the firmware clamps every velocity to its internal cap, so values
+# above the observed limits simply request the ceiling.
+DRAW_SPEED   = 400     # mm/s per CP segment (firmware clamps ~200 observed)
+TRAVEL_SPEED = 400     # mm/s PTP pen-up travel (firmware-clamped)
+Z_SPEED      = 150     # mm/s pen lift/lower — kept moderate for clean contact
+
+CP_PLAN_ACC     = 400.0   # mm/s²  CP look-ahead planner acceleration
+CP_JUNCTION_VEL = 400.0   # mm/s   blending speed at CP waypoint junctions
+CP_ACC          = 400.0   # mm/s²  CP acceleration (non-realtime mode)
+
+PTP_JOINT_VEL = 320.0     # deg/s  — Magician spec max joint speed
+PTP_JOINT_ACC = 300.0     # deg/s²
 
 MIN_REACH_MM = 170.0
 MAX_REACH_MM = 315.0
@@ -29,7 +41,6 @@ PORT = "/dev/ttyUSB0"
 
 import struct
 import sys
-import time
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -37,6 +48,11 @@ import matplotlib.collections as mc
 from pathlib import Path
 
 ROOT = Path(__file__).parent
+
+try:
+    from image_profile import binarize_auto
+except ImportError:
+    binarize_auto = None   # falls back to fixed-Otsu detect_edges()
 
 
 # ── Image pipeline ────────────────────────────────────────────────────────────
@@ -102,6 +118,11 @@ def extract_strokes(ink_mask: np.ndarray) -> list[np.ndarray]:
         length = np.sum(np.linalg.norm(np.diff(spts, axis=0), axis=1))
         if length < MIN_STROKE_LEN:
             continue
+        # A tight curl can pass the arc-length filter while still being a
+        # dot on paper — reject on spatial extent too.
+        extent = np.linalg.norm(spts.max(axis=0) - spts.min(axis=0))
+        if extent < MIN_STROKE_EXTENT_PX:
+            continue
         strokes.append(spts)
 
     return strokes
@@ -112,9 +133,79 @@ def order_strokes(strokes: list[np.ndarray]) -> list[np.ndarray]:
         return strokes
     try:
         from scipy.spatial import KDTree
-        return _order_strokes_kdtree(strokes)
+        ordered = _order_strokes_kdtree(strokes)
     except ImportError:
-        return _order_strokes_greedy(strokes)
+        ordered = _order_strokes_greedy(strokes)
+    return _two_opt(ordered)
+
+
+def _travel_cost(strokes: list[np.ndarray]) -> float:
+    return sum(float(np.linalg.norm(strokes[k + 1][0] - strokes[k][-1]))
+               for k in range(len(strokes) - 1))
+
+
+def _two_opt(ordered: list[np.ndarray], max_passes: int = 6) -> list[np.ndarray]:
+    """Improve the greedy order with 2-opt (open path, strokes reversible).
+
+    Reversing the sub-sequence [i..j] (each stroke also reversed) keeps all
+    internal link costs, so only the two boundary links change — classic
+    2-opt. Inner loop over j is vectorized with numpy.
+    """
+    n = len(ordered)
+    if n < 3:
+        return ordered
+    strokes = list(ordered)
+    starts = np.array([s[0] for s in strokes])
+    ends   = np.array([s[-1] for s in strokes])
+
+    for _ in range(max_passes):
+        improved = False
+        for i in range(n - 1):
+            js = np.arange(i + 1, n)
+            has_next = js < n - 1
+            nxt = starts[np.minimum(js + 1, n - 1)]
+
+            old_next = np.where(
+                has_next, np.linalg.norm(ends[js] - nxt, axis=1), 0.0)
+            new_next = np.where(
+                has_next, np.linalg.norm(starts[i] - nxt, axis=1), 0.0)
+            if i > 0:
+                old_prev = float(np.linalg.norm(ends[i - 1] - starts[i]))
+                new_prev = np.linalg.norm(ends[js] - ends[i - 1], axis=1)
+            else:
+                old_prev = 0.0
+                new_prev = np.zeros(len(js))
+
+            gain = old_prev + old_next - new_prev - new_next
+            k = int(np.argmax(gain))
+            if gain[k] > 1e-6:
+                j = int(js[k])
+                seg = [s[::-1] for s in reversed(strokes[i:j + 1])]
+                strokes[i:j + 1] = seg
+                starts[i:j + 1] = [s[0] for s in seg]
+                ends[i:j + 1]   = [s[-1] for s in seg]
+                improved = True
+        if not improved:
+            break
+
+    return strokes
+
+
+def join_strokes(ordered: list[np.ndarray],
+                 tol: float = JOIN_TOL_PX) -> list[np.ndarray]:
+    """Concatenate consecutive strokes whose gap is <= tol px.
+
+    Skeleton-graph edges share junction nodes, so many consecutive strokes
+    have zero gap — joining them skips a pen lift/lower cycle each."""
+    if not ordered:
+        return ordered
+    merged = [ordered[0]]
+    for s in ordered[1:]:
+        if np.linalg.norm(merged[-1][-1] - s[0]) <= tol:
+            merged[-1] = np.vstack([merged[-1], s])
+        else:
+            merged.append(s)
+    return merged
 
 
 def _order_strokes_kdtree(strokes: list[np.ndarray]) -> list[np.ndarray]:
@@ -251,11 +342,38 @@ def _cp_cmd(arm, x: float, y: float, z: float, velocity: float):
     msg.id = 91                    # SET_CP_CMD
     msg.ctrl = ControlValues.THREE
     msg.params = bytearray([0x01]) # cpMode = absolute
-    msg.params.extend(struct.pack('f', x))
-    msg.params.extend(struct.pack('f', y))
-    msg.params.extend(struct.pack('f', z))
-    msg.params.extend(struct.pack('f', velocity))
+    msg.params.extend(struct.pack('<f', x))
+    msg.params.extend(struct.pack('<f', y))
+    msg.params.extend(struct.pack('<f', z))
+    msg.params.extend(struct.pack('<f', velocity))
     return arm._send_command(msg)
+
+
+def _set_cp_params(arm, plan_acc: float, junction_vel: float, acc: float):
+    """SET_CP_PARAMS (ID 90) — never set by pydobot, so the CP look-ahead
+    planner otherwise runs at firmware boot defaults. junctionVel is the
+    blending speed at waypoint junctions; raising it is the main win for
+    real drawing throughput. Firmware clamps out-of-range values."""
+    from pydobot.message import Message
+    from pydobot.enums.ControlValues import ControlValues
+    msg = Message()
+    msg.id = 90                    # SET_CP_PARAMS
+    msg.ctrl = ControlValues.ONE   # immediate
+    msg.params = bytearray()
+    msg.params.extend(struct.pack('<f', plan_acc))
+    msg.params.extend(struct.pack('<f', junction_vel))
+    msg.params.extend(struct.pack('<f', acc))
+    msg.params.extend(bytearray([0x00]))  # realTimeTrack off
+    return arm._send_command(msg)
+
+
+def _speed(arm, mm_s: float) -> None:
+    """arm.speed() costs two serial round-trips; skip when unchanged.
+    Cache lives on the arm object so a reconnect (which resets firmware
+    speed params) starts with a fresh cache."""
+    if getattr(arm, "_last_speed", None) != mm_s:
+        arm.speed(mm_s, mm_s)
+        arm._last_speed = mm_s
 
 
 def _recover(arm) -> None:
@@ -292,7 +410,14 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
         pose = arm.pose()
         print(f"Connected. Current pose: x={pose[0]:.1f} y={pose[1]:.1f} z={pose[2]:.1f}")
 
-        arm.speed(TRAVEL_SPEED, TRAVEL_SPEED)
+        # Push speed limits once — firmware clamps to its internal caps.
+        arm._set_ptp_joint_params(PTP_JOINT_VEL, PTP_JOINT_VEL,
+                                  PTP_JOINT_VEL, PTP_JOINT_VEL,
+                                  PTP_JOINT_ACC, PTP_JOINT_ACC,
+                                  PTP_JOINT_ACC, PTP_JOINT_ACC)
+        _set_cp_params(arm, CP_PLAN_ACC, CP_JUNCTION_VEL, CP_ACC)
+
+        _speed(arm, TRAVEL_SPEED)
         arm._set_ptp_cmd(pose[0], pose[1], Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
 
         skipped = 0
@@ -303,11 +428,11 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
                   f"xy=({x0:.1f},{y0:.1f}) z={z0:.1f}", end="\r")
 
             # travel
-            arm.speed(TRAVEL_SPEED, TRAVEL_SPEED)
+            _speed(arm, TRAVEL_SPEED)
             arm._set_ptp_cmd(x0, y0, Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
 
             # pen down
-            arm.speed(Z_SPEED, Z_SPEED)
+            _speed(arm, Z_SPEED)
             try:
                 arm._set_ptp_cmd(x0, y0, z0, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
             except RuntimeError:
@@ -327,7 +452,7 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
                 x_last, y_last = x, y
 
             # pen up
-            arm.speed(Z_SPEED, Z_SPEED)
+            _speed(arm, Z_SPEED)
             arm._set_ptp_cmd(x_last, y_last, Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
 
         print(f"\nDone — {total} strokes, {skipped} skipped.")
@@ -344,12 +469,21 @@ def main():
     gray = load_image(IMAGE_PATH)
     h, w = gray.shape
 
-    mask    = detect_edges(gray)
+    if binarize_auto is not None:
+        mask, prof = binarize_auto(gray)
+        print(prof.summary())
+    else:
+        mask = detect_edges(gray)
+
     strokes = extract_strokes(mask)
+    n_raw = len(strokes)
     strokes = order_strokes(strokes)
+    strokes = join_strokes(strokes)
 
     total_pts = sum(len(s) for s in strokes)
-    print(f"Strokes: {len(strokes)},  total points: {total_pts}")
+    print(f"Strokes: {n_raw} extracted -> {len(strokes)} after join,  "
+          f"total points: {total_pts},  "
+          f"pen-up travel: {_travel_cost(strokes):.0f}px")
 
     bad = 0
     for s in strokes:
