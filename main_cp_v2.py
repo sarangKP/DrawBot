@@ -1,5 +1,5 @@
 # ── Constants ────────────────────────────────────────────────────────────────
-IMAGE_PATH      = "/home/user/Dobot_v2/images/Test_2.png"
+IMAGE_PATH      = "/home/user/Dobot_v2/images/Eyes.jpeg"
 MAX_SIDE_PX     = 800
 APPROX_EPSILON  = 1.5
 MIN_STROKE_LEN  = 3     # only drops degenerate specks, keeps short hatch marks
@@ -19,18 +19,21 @@ CAL_Z_CORNERS = [-51.48863220214844, -50.695167541503906,
 
 Z_UP         = -31.821640014648438   # pen-lifted height
 
-# Speeds: the firmware clamps every velocity to its internal cap, so values
-# above the observed limits simply request the ceiling.
-DRAW_SPEED   = 400     # mm/s per CP segment (firmware clamps ~200 observed)
-TRAVEL_SPEED = 400     # mm/s PTP pen-up travel (firmware-clamped)
+# Speeds: firmware does NOT just silently clamp overspeed requests — pushing
+# PTP_JOINT_VEL to the spec-sheet max (320) tripped a motion alarm mid-move,
+# which freezes the command queue permanently (not a slowdown, a hang) until
+# the 60s wait() timeout blows up the whole script. Back off from the edge;
+# these were confirmed stable, the joint knob above 200 was not.
+DRAW_SPEED   = 200     # mm/s per CP segment — documented firmware cap ~200
+TRAVEL_SPEED = 300     # mm/s PTP pen-up travel
 Z_SPEED      = 150     # mm/s pen lift/lower — kept moderate for clean contact
 
-CP_PLAN_ACC     = 400.0   # mm/s²  CP look-ahead planner acceleration
-CP_JUNCTION_VEL = 400.0   # mm/s   blending speed at CP waypoint junctions
-CP_ACC          = 400.0   # mm/s²  CP acceleration (non-realtime mode)
+CP_PLAN_ACC     = 250.0   # mm/s²  CP look-ahead planner acceleration
+CP_JUNCTION_VEL = 250.0   # mm/s   blending speed at CP waypoint junctions
+CP_ACC          = 250.0   # mm/s²  CP acceleration (non-realtime mode)
 
-PTP_JOINT_VEL = 320.0     # deg/s  — Magician spec max joint speed
-PTP_JOINT_ACC = 300.0     # deg/s²
+PTP_JOINT_VEL = 200.0     # deg/s  — firmware init default, confirmed stable
+PTP_JOINT_ACC = 200.0     # deg/s²
 
 MIN_REACH_MM = 170.0
 MAX_REACH_MM = 315.0
@@ -420,6 +423,21 @@ def _recover(arm) -> None:
         pass
 
 
+def _move_or_recover(arm, x: float, y: float, z: float, mode) -> bool:
+    """PTP move that survives a firmware motion alarm. The firmware doesn't
+    just clamp overspeed requests — it can trip an alarm mid-move, which
+    freezes the queued-command index permanently until wait() times out
+    (60s) and raises. Catch that, clear the alarm, and let the caller skip
+    forward instead of crashing the whole run. Returns False on failure."""
+    try:
+        arm._set_ptp_cmd(x, y, z, 0, mode=mode, wait=True)
+        return True
+    except RuntimeError:
+        print(f"\nAlarm at ({x:.1f},{y:.1f},{z:.1f}), clearing...")
+        _recover(arm)
+        return False
+
+
 # ── Draw loop ─────────────────────────────────────────────────────────────────
 
 def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
@@ -430,6 +448,10 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
     ports = list_ports.comports()
     if not ports:
         sys.exit("No serial ports found. Is the arm plugged in?")
+    available = [p.device for p in ports]
+    if PORT not in available:
+        sys.exit(f"{PORT} not found. Is the arm plugged in? "
+                 f"Available ports: {', '.join(available)}")
     print(f"Connecting on {PORT} ...")
     arm = pydobot.Dobot(port=PORT, verbose=False)
 
@@ -439,7 +461,9 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
         pose = arm.pose()
         print(f"Connected. Current pose: x={pose[0]:.1f} y={pose[1]:.1f} z={pose[2]:.1f}")
 
-        # Push speed limits once — firmware clamps to its internal caps.
+        # Push speed limits once. Values above the confirmed-stable range
+        # can trip a motion alarm rather than being silently clamped —
+        # see PTP_JOINT_VEL comment above.
         arm._set_ptp_joint_params(PTP_JOINT_VEL, PTP_JOINT_VEL,
                                   PTP_JOINT_VEL, PTP_JOINT_VEL,
                                   PTP_JOINT_ACC, PTP_JOINT_ACC,
@@ -447,7 +471,7 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
         _set_cp_params(arm, CP_PLAN_ACC, CP_JUNCTION_VEL, CP_ACC)
 
         _speed(arm, TRAVEL_SPEED)
-        arm._set_ptp_cmd(pose[0], pose[1], Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
+        _move_or_recover(arm, pose[0], pose[1], Z_UP, PTPMode.MOVJ_XYZ)
 
         skipped = 0
         total = len(strokes)
@@ -456,18 +480,15 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
             print(f"Stroke {i+1}/{total}  ({len(stroke)} pts)  "
                   f"xy=({x0:.1f},{y0:.1f}) z={z0:.1f}", end="\r")
 
-            # travel
+            # travel — an alarm here just means retry next stroke, not crash
             _speed(arm, TRAVEL_SPEED)
-            arm._set_ptp_cmd(x0, y0, Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
+            if not _move_or_recover(arm, x0, y0, Z_UP, PTPMode.MOVJ_XYZ):
+                skipped += 1
+                continue
 
             # pen down
             _speed(arm, Z_SPEED)
-            try:
-                arm._set_ptp_cmd(x0, y0, z0, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
-            except RuntimeError:
-                print(f"\nSkipping stroke {i+1} — alarm at "
-                      f"({x0:.1f},{y0:.1f},{z0:.1f}), clearing...")
-                _recover(arm)
+            if not _move_or_recover(arm, x0, y0, z0, PTPMode.MOVJ_XYZ):
                 skipped += 1
                 continue
 
@@ -480,9 +501,14 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
                 _cp_cmd(arm, x, y, z, DRAW_SPEED)
                 x_last, y_last = x, y
 
-            # pen up
+            # pen up — retry once after recovery; if it still fails the pen
+            # may be physically down, which would drag into the next
+            # stroke's travel move, so this is worth a loud warning.
             _speed(arm, Z_SPEED)
-            arm._set_ptp_cmd(x_last, y_last, Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
+            if not _move_or_recover(arm, x_last, y_last, Z_UP, PTPMode.MOVJ_XYZ):
+                if not _move_or_recover(arm, x_last, y_last, Z_UP, PTPMode.MOVJ_XYZ):
+                    print(f"\nWARNING: pen-up failed twice after stroke {i+1} — "
+                          f"pen may be dragging on the surface.")
 
         print(f"\nDone — {total} strokes, {skipped} skipped.")
 
