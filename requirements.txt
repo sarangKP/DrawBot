@@ -5,3 +5,4 @@ pyserial
 scikit-image
 scipy
 sknw @ git+https://github.com/yxdragon/sknw.git
+-e ./pydobot
