@@ -21,6 +21,8 @@ UNEVEN_ILLUM     = 0.15   # background spread ratio above which adaptive thresho
 STRONG_BIMODALITY = 0.90  # above this a global threshold separates cleanly anyway
 PHOTO_INK_RATIO  = 0.35   # dark-pixel fraction above which image is photo-like
 PHOTO_BIMODALITY = 0.55   # bimodality below which histogram is not ink-vs-paper
+DESPECK_FACTOR   = 0.6    # despeck min-area = (stroke_width_px * this)**2 —
+                          # full stroke_width**2 was killing short legit marks
 
 
 @dataclass
@@ -118,11 +120,15 @@ def _remove_specks(mask: np.ndarray, min_area: int) -> np.ndarray:
     return np.where(keep[labels], 255, 0).astype(np.uint8)
 
 
-def binarize_auto(gray: np.ndarray) -> tuple[np.ndarray, ImageProfile]:
+def binarize_auto(
+    gray: np.ndarray,
+) -> tuple[np.ndarray, ImageProfile, np.ndarray]:
     """Measure the image and binarize it with a pipeline matched to it.
 
-    Returns (ink_mask, profile). The mask is uint8 {0, 255}, ink = 255,
-    ready for skeletonize + sknw like the old fixed-Otsu detect_edges().
+    Returns (ink_mask, profile, pre_despeck_mask). ink_mask is uint8
+    {0, 255}, ready for skeletonize + sknw like the old fixed-Otsu
+    detect_edges(). pre_despeck_mask is the mask right before the
+    connected-component speck filter, for previewing what despeck removes.
     """
     prof = analyze(gray)
     img = gray
@@ -173,13 +179,15 @@ def binarize_auto(gray: np.ndarray) -> tuple[np.ndarray, ImageProfile]:
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     prof.steps.append(f"morph-close-{close_px}")
 
-    # Kill isolated specks smaller than roughly one stroke-width dot.
+    pre_despeck = mask.copy()
+
+    # Kill isolated specks smaller than a fraction of one stroke-width dot.
     # Canny lines are 1px wide, so the lineart heuristic would erase them.
     if prof.kind == "photo":
         min_area = 8
     else:
-        min_area = max(4, int(round(prof.stroke_width_px ** 2)))
+        min_area = max(4, int(round((prof.stroke_width_px * DESPECK_FACTOR) ** 2)))
     mask = _remove_specks(mask, min_area)
     prof.steps.append(f"despeck(area<{min_area})")
 
-    return mask, prof
+    return mask, prof, pre_despeck

@@ -96,7 +96,11 @@ def detect_edges(gray: np.ndarray) -> np.ndarray:
     return mask
 
 
-def extract_strokes(ink_mask: np.ndarray) -> list[np.ndarray]:
+def extract_strokes(
+    ink_mask: np.ndarray,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Returns (kept_strokes, dropped_strokes) — dropped is everything cut
+    by the length/extent filters, for the preview to show what got lost."""
     from skimage.morphology import skeletonize
     import sknw
 
@@ -104,6 +108,7 @@ def extract_strokes(ink_mask: np.ndarray) -> list[np.ndarray]:
     graph    = sknw.build_sknw(skeleton)
 
     strokes = []
+    dropped = []
     for u, v, data in graph.edges(data=True):
         node_u = graph.nodes[u]["o"].reshape(1, 2)
         node_v = graph.nodes[v]["o"].reshape(1, 2)
@@ -117,15 +122,17 @@ def extract_strokes(ink_mask: np.ndarray) -> list[np.ndarray]:
         spts = simplified[:, 0, :].astype(float)
         length = np.sum(np.linalg.norm(np.diff(spts, axis=0), axis=1))
         if length < MIN_STROKE_LEN:
+            dropped.append(spts)
             continue
         # A tight curl can pass the arc-length filter while still being a
         # dot on paper — reject on spatial extent too.
         extent = np.linalg.norm(spts.max(axis=0) - spts.min(axis=0))
         if extent < MIN_STROKE_EXTENT_PX:
+            dropped.append(spts)
             continue
         strokes.append(spts)
 
-    return strokes
+    return strokes, dropped
 
 
 def order_strokes(strokes: list[np.ndarray]) -> list[np.ndarray]:
@@ -291,14 +298,36 @@ def check_reach(x_mm: float, y_mm: float) -> bool:
 
 # ── Preview ───────────────────────────────────────────────────────────────────
 
-def preview(gray: np.ndarray, strokes: list[np.ndarray]) -> None:
-    _, axes = plt.subplots(1, 2, figsize=(12, 6))
+def preview(gray: np.ndarray, pre_despeck: np.ndarray, mask: np.ndarray,
+           strokes: list[np.ndarray], dropped: list[np.ndarray]) -> None:
+    """4-panel: input, mask before despeck, mask after despeck (fed to
+    skeletonize), final strokes. Speck removed by despeck = pre_despeck
+    minus mask, shown in orange. Strokes killed by the length/extent
+    filters (still present in the mask) are shown in red on the final
+    mask panel, so the two loss stages are visible separately."""
+    _, axes = plt.subplots(1, 4, figsize=(22, 6))
 
     axes[0].imshow(gray, cmap="gray")
     axes[0].set_title("Input (preprocessed)")
     axes[0].axis("off")
 
-    h, w   = gray.shape
+    h, w = gray.shape
+
+    removed_by_despeck = cv2.subtract(pre_despeck, mask)
+    speck_rgb = np.zeros((*pre_despeck.shape, 3), dtype=np.uint8)
+    speck_rgb[mask > 0] = (255, 255, 255)
+    speck_rgb[removed_by_despeck > 0] = (255, 140, 0)
+    n_speck_px = int((removed_by_despeck > 0).sum())
+    axes[1].imshow(speck_rgb)
+    axes[1].set_title(f"Despeck  (orange = {n_speck_px}px removed)")
+    axes[1].axis("off")
+
+    axes[2].imshow(mask, cmap="gray")
+    for s in dropped:
+        axes[2].plot(s[:, 0], s[:, 1], color="red", linewidth=1.2)
+    axes[2].set_title(f"Ink mask  (red = {len(dropped)} dropped strokes)")
+    axes[2].axis("off")
+
     cmap   = plt.get_cmap("plasma")
     n      = len(strokes)
     segs   = []
@@ -309,12 +338,12 @@ def preview(gray: np.ndarray, strokes: list[np.ndarray]) -> None:
             colors.append(cmap(i / max(n - 1, 1)))
 
     lc = mc.LineCollection(segs, colors=colors, linewidths=0.8)
-    axes[1].add_collection(lc)
-    axes[1].set_xlim(0, w)
-    axes[1].set_ylim(h, 0)
-    axes[1].set_aspect("equal")
-    axes[1].set_title(f"Strokes  n={n}  pts={sum(len(s) for s in strokes)}")
-    axes[1].axis("off")
+    axes[3].add_collection(lc)
+    axes[3].set_xlim(0, w)
+    axes[3].set_ylim(h, 0)
+    axes[3].set_aspect("equal")
+    axes[3].set_title(f"Strokes  n={n}  pts={sum(len(s) for s in strokes)}")
+    axes[3].axis("off")
 
     plt.tight_layout()
     plt.show()
@@ -470,12 +499,13 @@ def main():
     h, w = gray.shape
 
     if binarize_auto is not None:
-        mask, prof = binarize_auto(gray)
+        mask, prof, pre_despeck = binarize_auto(gray)
         print(prof.summary())
     else:
         mask = detect_edges(gray)
+        pre_despeck = mask.copy()
 
-    strokes = extract_strokes(mask)
+    strokes, dropped = extract_strokes(mask)
     n_raw = len(strokes)
     strokes = order_strokes(strokes)
     strokes = join_strokes(strokes)
@@ -498,9 +528,9 @@ def main():
         print("Reach check OK.")
 
     if dry_run:
-        preview(gray, strokes)
+        preview(gray, pre_despeck, mask, strokes, dropped)
     else:
-        preview(gray, strokes)
+        preview(gray, pre_despeck, mask, strokes, dropped)
         input("Close the preview window, then press Enter to start drawing...")
         draw(strokes, w, h)
 
