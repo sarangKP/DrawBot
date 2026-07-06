@@ -1,5 +1,5 @@
 # ── Constants ────────────────────────────────────────────────────────────────
-IMAGE_PATH      = "/home/user/Dobot_v2/images/Eyes.jpeg"
+IMAGE_PATH      = "/home/user/Dobot_v2/images/Tier_4.png"
 MAX_SIDE_PX     = 800
 APPROX_EPSILON  = 1.5
 MIN_STROKE_LEN  = 3     # only drops degenerate specks, keeps short hatch marks
@@ -25,6 +25,10 @@ Z_UP         = -31.821640014648438   # pen-lifted height
 # the 60s wait() timeout blows up the whole script. Back off from the edge;
 # these were confirmed stable, the joint knob above 200 was not.
 DRAW_SPEED   = 200     # mm/s per CP segment — documented firmware cap ~200
+CP_DEDUP_EPS_MM = 0.05  # skip a CP point coincident with the last one sent —
+                        # a zero-length segment at speed hangs the firmware's
+                        # CP junction planner silently (no alarm, queue just
+                        # stops draining) rather than raising any error
 TRAVEL_SPEED = 300     # mm/s PTP pen-up travel
 Z_SPEED      = 150     # mm/s pen lift/lower — kept moderate for clean contact
 
@@ -44,6 +48,7 @@ PORT = "/dev/ttyUSB1"
 
 import struct
 import sys
+import time
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -354,6 +359,28 @@ def preview(gray: np.ndarray, pre_despeck: np.ndarray, mask: np.ndarray,
 
 # ── CP draw helpers ───────────────────────────────────────────────────────────
 
+def _vlog(verbose: bool, msg: str) -> None:
+    if verbose:
+        print(f"[v {time.strftime('%H:%M:%S')}] {msg}")
+
+
+class _Tee:
+    """Duplicates writes to multiple streams — lets stdout keep printing to
+    the terminal while everything (including pydobot's own verbose >>/<<
+    prints) also lands in a log file, so -v runs don't need copy-pasting."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
 def _clear_alarm(arm) -> None:
     from pydobot.message import Message
     from pydobot.enums.CommunicationProtocolIDs import CommunicationProtocolIDs
@@ -422,6 +449,18 @@ def _recover(arm) -> None:
     except Exception:
         pass
 
+    # Clearing the queue does NOT mean the pen is up — a stalled/timed-out
+    # command (e.g. a pen-up move) may have frozen with the pen still down.
+    # Read the arm's actual current pose (immediate query, unaffected by a
+    # frozen queue) and force a blocking Z-only lift from there, so the next
+    # travel move never drags a still-down pen across the page.
+    from pydobot.enums import PTPMode
+    try:
+        pose = arm.pose()
+        arm._set_ptp_cmd(pose[0], pose[1], Z_UP, 0, mode=PTPMode.MOVJ_XYZ, wait=True)
+    except Exception as e:
+        print(f"WARNING: forced pen-up after recovery failed: {e}")
+
 
 def _move_or_recover(arm, x: float, y: float, z: float, mode) -> bool:
     """PTP move that survives a firmware motion alarm. The firmware doesn't
@@ -440,7 +479,7 @@ def _move_or_recover(arm, x: float, y: float, z: float, mode) -> bool:
 
 # ── Draw loop ─────────────────────────────────────────────────────────────────
 
-def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
+def draw(strokes: list[np.ndarray], img_w: int, img_h: int, verbose: bool = False) -> None:
     import pydobot
     from pydobot.enums import PTPMode
     from serial.tools import list_ports
@@ -453,7 +492,10 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
         sys.exit(f"{PORT} not found. Is the arm plugged in? "
                  f"Available ports: {', '.join(available)}")
     print(f"Connecting on {PORT} ...")
-    arm = pydobot.Dobot(port=PORT, verbose=False)
+    # verbose=True on the Dobot itself makes pydobot print every raw
+    # command/response pair (>>/<<), which is what shows whether the
+    # queued-command index is actually advancing per CP point.
+    arm = pydobot.Dobot(port=PORT, verbose=verbose)
 
     try:
         _recover(arm)
@@ -495,20 +537,37 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
             # CP draw — all points queued without blocking
             # PTP pen-up is enqueued after all CP commands; waiting for its
             # execution index implicitly drains the entire CP queue first.
+            idx_before = arm._get_queued_cmd_current_index() if verbose else None
+            t0 = time.time()
             x_last, y_last = x0, y0
+            n_deduped = 0
             for pt in stroke[1:]:
                 x, y, z = px_to_mm(pt[0], pt[1], img_w, img_h)
+                if abs(x - x_last) < CP_DEDUP_EPS_MM and abs(y - y_last) < CP_DEDUP_EPS_MM:
+                    n_deduped += 1
+                    continue
                 _cp_cmd(arm, x, y, z, DRAW_SPEED)
                 x_last, y_last = x, y
+            if verbose:
+                idx_after = arm._get_queued_cmd_current_index()
+                n_pts = len(stroke) - 1 - n_deduped
+                _vlog(verbose,
+                      f"stroke {i+1}/{total}: {n_pts} CP pts submitted "
+                      f"({n_deduped} deduped) in {time.time() - t0:.2f}s, "
+                      f"queue idx {idx_before} -> {idx_after} "
+                      f"(delta {idx_after - idx_before}, expected >= {n_pts})")
 
-            # pen up — retry once after recovery; if it still fails the pen
-            # may be physically down, which would drag into the next
-            # stroke's travel move, so this is worth a loud warning.
+            # pen up — retry once after recovery. If it still fails the pen
+            # is likely physically down, and continuing would drag it through
+            # every remaining stroke's travel move — abort instead of limping
+            # on with a ruined drawing.
             _speed(arm, Z_SPEED)
             if not _move_or_recover(arm, x_last, y_last, Z_UP, PTPMode.MOVJ_XYZ):
                 if not _move_or_recover(arm, x_last, y_last, Z_UP, PTPMode.MOVJ_XYZ):
-                    print(f"\nWARNING: pen-up failed twice after stroke {i+1} — "
-                          f"pen may be dragging on the surface.")
+                    print(f"\nERROR: pen-up failed twice after stroke {i+1}/{total} — "
+                          f"pen may be dragging on the surface. Aborting rather than "
+                          f"drawing further with the pen down.")
+                    sys.exit(1)
 
         print(f"\nDone — {total} strokes, {skipped} skipped.")
 
@@ -520,7 +579,26 @@ def draw(strokes: list[np.ndarray], img_w: int, img_h: int) -> None:
 
 def main():
     dry_run = "--dry-run" in sys.argv or "-n" in sys.argv
+    verbose = "--verbose" in sys.argv or "-v" in sys.argv
 
+    log_file = None
+    if verbose:
+        log_dir = ROOT / "logs"
+        log_dir.mkdir(exist_ok=True)
+        log_path = log_dir / f"draw_{time.strftime('%Y%m%d_%H%M%S')}.log"
+        log_file = open(log_path, "w")
+        sys.stdout = _Tee(sys.stdout, log_file)
+        print(f"Logging to {log_path}")
+
+    try:
+        _main_body(dry_run, verbose)
+    finally:
+        if log_file is not None:
+            sys.stdout = sys.stdout.streams[0]
+            log_file.close()
+
+
+def _main_body(dry_run: bool, verbose: bool) -> None:
     gray = load_image(IMAGE_PATH)
     h, w = gray.shape
 
@@ -558,7 +636,7 @@ def main():
     else:
         preview(gray, pre_despeck, mask, strokes, dropped)
         input("Close the preview window, then press Enter to start drawing...")
-        draw(strokes, w, h)
+        draw(strokes, w, h, verbose=verbose)
 
 
 if __name__ == "__main__":

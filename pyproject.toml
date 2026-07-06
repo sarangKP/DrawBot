@@ -12,9 +12,12 @@ dependencies = [
     "scikit-image",
     "scipy",
     "sknw @ git+https://github.com/yxdragon/sknw.git",
-    "pydobot @ file:///home/user/Dobot_v2/pydobot",
+    "pydobot",
     "vpype>=1.15.0",
 ]
 
 [tool.setuptools]
 packages = []
+
+[tool.uv.sources]
+pydobot = { path = "pydobot", editable = false }

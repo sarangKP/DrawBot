@@ -1,5 +1,5 @@
 # ── Constants ────────────────────────────────────────────────────────────────
-IMAGE_PATH      = "images/Test_1.png"
+IMAGE_PATH      = "/home/user/Dobot_v2/images/Test_2.png"
 MAX_SIDE_PX     = 800
 CANNY_LOW       = 80
 CANNY_HIGH      = 200
