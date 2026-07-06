@@ -38,7 +38,7 @@ PTP_JOINT_ACC = 200.0     # deg/s²
 MIN_REACH_MM = 170.0
 MAX_REACH_MM = 315.0
 
-PORT = "/dev/ttyUSB0"
+PORT = "/dev/ttyUSB1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -432,8 +432,8 @@ def _move_or_recover(arm, x: float, y: float, z: float, mode) -> bool:
     try:
         arm._set_ptp_cmd(x, y, z, 0, mode=mode, wait=True)
         return True
-    except RuntimeError:
-        print(f"\nAlarm at ({x:.1f},{y:.1f},{z:.1f}), clearing...")
+    except RuntimeError as e:
+        print(f"\nAlarm at ({x:.1f},{y:.1f},{z:.1f}): {e}. Clearing...")
         _recover(arm)
         return False
 

@@ -10,6 +10,7 @@ from .enums.CommunicationProtocolIDs import CommunicationProtocolIDs
 from .enums.ControlValues import ControlValues
 
 WAIT_TIMEOUT_S = 60.0   # max seconds to wait for a queued command to execute
+ALARM_POLL_EVERY_S = 0.5  # how often to check for a motion alarm while waiting
 
 
 class Dobot:
@@ -41,6 +42,14 @@ class Dobot:
         response = self._send_command(msg)
         idx = struct.unpack_from('<I', response.params, 0)[0]
         return idx
+
+    def _get_alarms_state(self):
+        """Raw alarm bitmask bytes (each bit = one fault, MSB->LSB per byte,
+        per protocol doc). Caller decides what counts as "active"."""
+        msg = Message()
+        msg.id = CommunicationProtocolIDs.GET_ALARMS_STATE
+        response = self._send_command(msg)
+        return bytes(response.params)
 
     def _get_pose(self):
         msg = Message()
@@ -95,6 +104,8 @@ class Dobot:
             print('pydobot: waiting for command', expected_idx)
 
         deadline = time.time() + WAIT_TIMEOUT_S
+        next_alarm_check = time.time() + ALARM_POLL_EVERY_S
+        alarm_streak = 0
         while True:
             current_idx = self._get_queued_cmd_current_index()
 
@@ -103,11 +114,29 @@ class Dobot:
                     print('pydobot: command %d executed' % current_idx)
                 break
 
-            if time.time() > deadline:
+            now = time.time()
+            if now > deadline:
                 raise RuntimeError(
                     f'Timeout waiting for command {expected_idx} '
                     f'(current={current_idx})'
                 )
+
+            # A motion alarm freezes current_idx permanently — no point
+            # burning the full 60s timeout waiting for it to move. Require
+            # two consecutive nonzero reads before trusting it, since a
+            # stray reserved bit on one read shouldn't abort a real move.
+            if now > next_alarm_check:
+                next_alarm_check = now + ALARM_POLL_EVERY_S
+                bits = self._get_alarms_state()
+                if any(bits):
+                    alarm_streak += 1
+                    if alarm_streak >= 2:
+                        raise RuntimeError(
+                            f'Alarm tripped waiting for command {expected_idx} '
+                            f'(current={current_idx}) bits={bits.hex()}'
+                        )
+                else:
+                    alarm_streak = 0
 
             time.sleep(0.1)
 
